@@ -1,16 +1,17 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import uvicorn
-from config.logging import logger
-from config.settings import settings
-from services.api_routes import (
+from backend.config.logging import logger
+from backend.config.settings import settings
+from backend.services.api_routes import (
     invoke_agent_handler, resume_agent_handler, get_agent_status_handler,
     get_agent_active_sessionid_handler, get_agent_sessionids_handler,
     get_system_info_handler, delete_agent_session_handler, write_long_term_handler,
-    cleanup_redis_manager
+    cleanup_redis_manager, router as api_router
 )
-from services.agent_service import cleanup_resources
-from models.schemas import (
+from backend.services.agent_service import cleanup_resources
+from backend.models.schemas import (
     AgentRequest, AgentResponse, InterruptResponse, LongMemRequest,
     SessionStatusResponse, ActiveSessionInfoResponse, SessionInfoResponse,
     SystemInfoResponse
@@ -52,6 +53,17 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# 添加CORS中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],  # 前端开发服务器
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(api_router)
 
 # API路由定义
 

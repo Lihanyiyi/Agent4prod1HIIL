@@ -1,17 +1,60 @@
-from fastapi import HTTPException
-from config.logging import logger
-from models.schemas import (
+from fastapi import HTTPException, APIRouter, Depends, Query, Body
+from backend.config.logging import logger
+from backend.models.schemas import (
     AgentRequest, AgentResponse, InterruptResponse, LongMemRequest,
     SessionStatusResponse, ActiveSessionInfoResponse, SessionInfoResponse,
-    SystemInfoResponse
+    SystemInfoResponse, UserRegisterRequest, UserLoginRequest, UserResponse, TokenResponse, User,
+    HILReview, HILReviewCreate, HILReviewUpdate, HILReviewResponse
 )
-from services.agent_service import execute_agent, resume_agent, write_long_term_info
-from services.Redis_service import RedisSessionManager
-from config.settings import settings
+from backend.services.agent_service import execute_agent, resume_agent, write_long_term_info, get_password_hash, verify_password, create_access_token, decode_access_token
+from backend.services.Redis_service import RedisSessionManager
+from backend.config.settings import settings
 import time
+from sqlalchemy.orm import Session
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError
+from typing import List
+from pydantic import BaseModel
 
 # 全局Redis管理器实例
 redis_manager: RedisSessionManager = None
+
+DATABASE_URL = settings.DB_URI
+engine = create_engine(DATABASE_URL, echo=True, future=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+router = APIRouter()
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = decode_access_token(token)
+        if payload is None:
+            raise credentials_exception
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
 
 # 初始化Redis管理器
 async def get_redis_manager() -> RedisSessionManager:
@@ -198,7 +241,7 @@ async def get_agent_sessionids_handler(user_id: str) -> SessionInfoResponse:
         raise HTTPException(status_code=500, detail=f"获取用户所有会话ID失败: {str(e)}")
 
 # 获取系统信息接口
-async def get_system_info_handler() -> SystemInfoResponse:
+async def get_system_info_handler(current_user: User = Depends(get_current_user)) -> SystemInfoResponse:
     """
     获取系统信息
     
@@ -299,4 +342,70 @@ async def cleanup_redis_manager():
     if redis_manager:
         await redis_manager.close()
         redis_manager = None
-        logger.info("Redis管理器已清理") 
+        logger.info("Redis管理器已清理")
+
+def get_message(msg_en, msg_zh, lang):
+    return msg_zh if lang == 'zh' else msg_en
+
+@router.post("/register", response_model=UserResponse)
+def register_user(user: UserRegisterRequest, db: Session = Depends(get_db), lang: str = Query('en', description="Language: en or zh")):
+    # Check if username or email exists
+    if db.query(User).filter((User.username == user.username) | (User.email == user.email)).first():
+        raise HTTPException(status_code=400, detail=get_message("Username or email already registered", "用户名或邮箱已被注册", lang))
+    hashed_password = get_password_hash(user.password)
+    db_user = User(username=user.username, email=user.email, hashed_password=hashed_password)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return UserResponse(id=db_user.id, username=db_user.username, email=db_user.email)
+
+@router.post("/login", response_model=TokenResponse)
+def login_user(user: UserLoginRequest, db: Session = Depends(get_db), lang: str = Query('en', description="Language: en or zh")):
+    db_user = db.query(User).filter(User.username == user.username).first()
+    if not db_user or not verify_password(user.password, db_user.hashed_password):
+        raise HTTPException(status_code=401, detail=get_message("Incorrect username or password", "用户名或密码错误", lang))
+    access_token = create_access_token({"sub": db_user.username, "user_id": db_user.id})
+    return TokenResponse(access_token=access_token)
+
+@router.post("/hil/review", response_model=HILReviewResponse)
+def create_hil_review(review: HILReviewCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    db_review = HILReview(**review.dict())
+    db.add(db_review)
+    db.commit()
+    db.refresh(db_review)
+    return db_review
+
+@router.get("/hil/review", response_model=List[HILReviewResponse])
+def list_hil_reviews(skip: int = 0, limit: int = 20, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    reviews = db.query(HILReview).order_by(HILReview.created_at.desc()).offset(skip).limit(limit).all()
+    return reviews
+
+@router.get("/hil/review/{review_id}", response_model=HILReviewResponse)
+def get_hil_review(review_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    review = db.query(HILReview).filter(HILReview.id == review_id).first()
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found")
+    return review
+
+@router.put("/hil/review/{review_id}", response_model=HILReviewResponse)
+def update_hil_review(review_id: int, update: HILReviewUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    review = db.query(HILReview).filter(HILReview.id == review_id).first()
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found")
+    for key, value in update.dict(exclude_unset=True).items():
+        setattr(review, key, value)
+    db.commit()
+    db.refresh(review)
+    return review
+
+class PasswordChangeRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+@router.post("/user/change-password")
+def change_password(request: PasswordChangeRequest = Body(...), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if not verify_password(request.old_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Old password is incorrect")
+    current_user.hashed_password = get_password_hash(request.new_password)
+    db.commit()
+    return {"message": "Password updated successfully"} 

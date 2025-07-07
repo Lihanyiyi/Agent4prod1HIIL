@@ -1,20 +1,52 @@
 import time
 from typing import Dict, Any, Optional, List
-from langgraph.types import interrupt, Command
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres import AsyncPostgresStore
-from langchain_core.messages.utils import count_tokens_approximately, trim_messages
+from langchain_core.messages.utils import trim_messages
 from psycopg_pool import AsyncConnectionPool
-from config.logging import logger
-from config.settings import settings
-from models.schemas import AgentResponse, AgentRequest, InterruptResponse
-from services.Redis_service import RedisSessionManager
+from backend.config.logging import logger
+from backend.config import settings
+from backend.models.schemas import AgentResponse, AgentRequest, InterruptResponse
+from backend.services.Redis_service import RedisSessionManager
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+from datetime import datetime, timedelta
 
 # 全局变量存储智能体实例和数据库连接
 agent_instances: Dict[str, Any] = {}
 db_pool: Optional[AsyncConnectionPool] = None
 redis_manager: Optional[RedisSessionManager] = None
+
+# Password hashing context - using sha256_crypt for better compatibility
+pwd_context = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
+
+SECRET_KEY = "your_secret_key_here"  # Should be set in config
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def decode_access_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        return None
 
 # 初始化数据库连接池
 async def init_db_pool():
@@ -205,8 +237,8 @@ async def get_or_create_agent(session_id: str) -> Any:
             )
             
             # 导入工具和LLM
-            from utils.tools import get_tools
-            from utils.llms import get_llm
+            from backend.utils.tools import get_tools
+            from backend.utils.llms import get_llm
             
             # 获取工具和LLM
             tools = get_tools()
