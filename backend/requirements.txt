@@ -1,0 +1,16 @@
+langgraph
+langchain
+langchain-openai
+langgraph-checkpoint-postgres
+fastapi
+uvicorn
+redis
+concurrent-log-handler
+pydantic-settings
+python-dotenv
+langchain-mcp-adapters
+passlib
+python-jose[cryptography]
+sqlalchemy
+pydantic[email]
+psycopg2-binary

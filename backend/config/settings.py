@@ -24,7 +24,7 @@ class Settings:
     SESSION_TIMEOUT: int = 3600  # 1小时
 
     # PostgreSQL configuration
-    DB_URI: str = os.environ.get("DB_URI", "postgresql://user:password@localhost:5432/dbname")
+    DB_URI: str = os.environ.get("DB_URI", "postgresql://postgres:postgres@localhost:5432/postgres")
     MIN_SIZE: int = 5
     MAX_SIZE: int = 20
 

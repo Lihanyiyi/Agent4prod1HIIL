@@ -1,7 +1,10 @@
 # react_agents/models/schemas.py
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import Dict, Any, Optional, List
 import time
+from sqlalchemy import Column, Integer, String, DateTime, Boolean
+from . import Base
+from datetime import datetime
 
 # 客户端发起的运行智能体的请求数据
 class AgentRequest(BaseModel):
@@ -80,3 +83,73 @@ class SessionStatusResponse(BaseModel):
     last_updated: Optional[float] = None
     # 上次响应
     last_response: Optional[AgentResponse] = None
+
+# User registration request
+class UserRegisterRequest(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+
+# User login request
+class UserLoginRequest(BaseModel):
+    username: str
+    password: str
+
+# User response (for API)
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: EmailStr
+
+# Token response
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, index=True, nullable=False)
+    email = Column(String(120), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(128), nullable=False)
+
+class HILReview(Base):
+    __tablename__ = "hil_reviews"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(50), nullable=False)
+    session_id = Column(String(50), nullable=False)
+    task_id = Column(String(50), nullable=False)
+    tool_name = Column(String(100), nullable=False)
+    tool_args = Column(String(500), nullable=True)
+    status = Column(String(20), default="pending")  # pending, approved, rejected, edited, responded
+    feedback = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    reviewed_by = Column(String(50), nullable=True)
+    is_active = Column(Boolean, default=True)
+
+class HILReviewCreate(BaseModel):
+    user_id: str
+    session_id: str
+    task_id: str
+    tool_name: str
+    tool_args: Optional[str] = None
+
+class HILReviewUpdate(BaseModel):
+    status: str
+    feedback: Optional[str] = None
+    reviewed_by: Optional[str] = None
+
+class HILReviewResponse(BaseModel):
+    id: int
+    user_id: str
+    session_id: str
+    task_id: str
+    tool_name: str
+    tool_args: Optional[str]
+    status: str
+    feedback: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    reviewed_by: Optional[str]
+    is_active: bool

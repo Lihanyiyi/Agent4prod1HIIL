@@ -1,11 +1,11 @@
 import redis.asyncio as redis
-from typing import Dict, Any, Optional, List
+from typing import Dict, Optional, List
 import json
 from pydantic import BaseModel
 import uuid
 from datetime import timedelta
-from config.logging import logger
-from models.schemas import AgentResponse
+from backend.config.logging import logger
+from backend.models.schemas import AgentResponse
 
 # 实现redis相关方法 支持多用户多会话
 class RedisSessionManager:
