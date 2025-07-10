@@ -3,28 +3,17 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from backend.config.settings import app_config
 from backend.config.logging import logger
 
+
 MODEL_CONFIGS = {
-    "openai": {
-        "base_url": "https://nangeai.top/v1",
-        "api_key": "sk-33RqjaXhsrjeapy2KC3Di2wvG1Dd2pMDU9tHC2C2mwVxnxcw5HmLS",
-        "chat_model": "gpt-4o-mini",
-        "embedding_model": "text-embedding-3-small"
-    },
-    "oneapi": {
-        "base_url": "http://139.224.72.218:3000/v1",
-        "api_key": "sk-GseYmJ8pX1D0I200W7a5062e8f12122342323C4B724FfD66aD9",
-        "chat_model": "qwen-max",
-        "embedding_model": "text-embedding-v1"
-    },
     "qwen": {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "api_key": "sk-f718953877a84226888bb21bd882026e2e5",
+        "api_key": "",
         "chat_model": "qwen-turbo-latest",
         "embedding_model": "text-embedding-v1"
     }
 }
 
-DEFAULT_LLM_TYPE = "openai"
+DEFAULT_LLM_TYPE = "qwen"
 DEFAULT_TEMPERATURE = 0
 
 class LLMInitializationError(Exception):
