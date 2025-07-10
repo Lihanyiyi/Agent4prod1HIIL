@@ -1,6 +1,6 @@
 import logging
 from concurrent_log_handler import ConcurrentRotatingFileHandler
-from .settings import settings
+from .settings import app_config
 
 def setup_logging():
     logger = logging.getLogger(__name__)
@@ -8,9 +8,9 @@ def setup_logging():
     logger.handlers = []
 
     handler = ConcurrentRotatingFileHandler(
-        settings.LOG_FILE,
-        maxBytes=settings.MAX_BYTES,
-        backupCount=settings.BACKUP_COUNT
+        app_config.LOG_FILE,
+        maxBytes=app_config.MAX_BYTES,
+        backupCount=app_config.BACKUP_COUNT
     )
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(logging.Formatter(
@@ -19,6 +19,5 @@ def setup_logging():
 
     logger.addHandler(handler)
     return logger
-
 
 logger = setup_logging()
