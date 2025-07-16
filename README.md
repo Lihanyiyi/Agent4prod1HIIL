@@ -1,160 +1,140 @@
-# 智能体服务 API
+# Agent4prod1HIIL: Multi-Session AI Agent Service
 
-基于 LangGraph 的智能体服务，支持多用户多会话管理。
+## Overview
 
-## 项目结构
+**Agent4prod1HIIL** is a robust, production-ready backend system for managing multi-user, multi-session AI agents with advanced features such as tool-use, long-term memory, and Human-in-the-Loop (HIL) interruption and review. It is built on FastAPI, Celery, Redis, PostgreSQL, and LangGraph, and is designed for extensibility, reliability, and real-world deployment.
 
-```
-Agent4prod1HIIL/
-├── main.py                 # FastAPI应用主入口
-├── requirements.txt        # 项目依赖
-├── README.md              # 项目说明文档
-├── config/                # 配置模块
-│   ├── __init__.py
-│   ├── settings.py        # 系统配置
-│   └── logging.py         # 日志配置
-├── models/                # 数据模型
-│   ├── __init__.py
-│   └── schemas.py         # Pydantic数据模型
-├── services/              # 业务逻辑服务
-│   ├── __init__.py
-│   ├── Redis_service.py   # Redis会话管理
-│   ├── agent_service.py   # 智能体业务逻辑
-│   └── api_routes.py      # API路由处理
-└── utils/                 # 工具模块
-    ├── __init__.py
-    ├── config.py          # 配置工具
-    ├── llms.py            # LLM工具
-    └── tools.py           # 智能体工具
-```
+---
 
-## 功能特性
+## Key Features & Value
 
-- **多用户多会话管理**: 支持多个用户同时使用，每个用户可以有多个会话
-- **智能体中断恢复**: 支持智能体执行中断后的恢复操作
-- **长期记忆存储**: 支持用户长期记忆的存储和读取
-- **会话状态管理**: 完整的会话状态跟踪和管理
-- **RESTful API**: 提供完整的 REST API 接口
-- **异步处理**: 基于 FastAPI 的异步处理架构
+### 🤖 Multi-User, Multi-Session AI Agent
 
-## 安装依赖
+- Each user can have multiple independent sessions, each with multiple tasks.
+- Every session and task is tracked and managed in real time.
 
-```bash
-pip install -r requirements.txt
-```
+### 🔄 Asynchronous Task Processing
 
-## 环境配置
+- All agent invocations are handled asynchronously via Celery, ensuring scalability and responsiveness.
+- Users receive a task ID immediately and can poll for status/results.
 
-创建 `.env` 文件并配置以下环境变量：
+### 🛠️ Tool Use & Human-in-the-Loop (HIL)
 
-```env
-# 数据库配置
-DB_URI=postgresql://user:password@localhost:5432/dbname
+- Agents can call external tools as part of their reasoning.
+- If a tool call requires human approval, the session is **interrupted** and can be resumed after user confirmation.
 
-# LLM API配置
-QWEN_API_KEY=your_qwen_api_key
-```
+### 💾 Long-Term Memory
 
-## 启动服务
+- Users can write and store long-term memory, which is used to enhance agent context and performance.
 
-```bash
-python main.py
-```
+### 🗂️ Session & Task Management
 
-服务将在 `http://localhost:8000` 启动，API 文档可在 `http://localhost:8000/docs` 查看。
+- Full CRUD for sessions and tasks: create, list, delete, and status query.
+- System-wide and per-user session statistics.
 
-## API 接口
+### 🩺 Health & Observability
 
-### 1. 调用智能体
+- Built-in health check endpoint.
+- System info endpoint for monitoring active users and sessions.
 
-- **POST** `/agent/invoke`
-- 调用智能体处理用户请求
+---
 
-### 2. 恢复智能体执行
+## API Endpoints & Usage
 
-- **POST** `/agent/resume`
-- 处理智能体中断后的恢复
+### Agent Task Lifecycle
 
-### 3. 获取会话状态
+- **POST `/agent/invoke`**  
+  Start a new agent task (asynchronous).  
+  **Returns:** `{user_id, session_id, task_id}`
 
-- **GET** `/agent/status/{user_id}/{session_id}`
-- 获取指定会话的状态信息
+- **POST `/agent/resume`**  
+  Resume an interrupted agent task after human review.  
+  **Returns:** `{user_id, session_id, task_id}`
 
-### 4. 获取用户活跃会话
+- **GET `/agent/status/{user_id}/{session_id}/{task_id}`**  
+  Get the current status and result of a specific task.  
+  **Returns:** Task status, last query, last response, etc.
 
-- **GET** `/agent/active/sessionid/{user_id}`
-- 获取用户最近活跃的会话 ID
+### Session & Task Management
 
-### 5. 获取用户所有会话
+- **GET `/agent/sessionids/{user_id}`**  
+  List all session IDs for a user.
 
-- **GET** `/agent/sessionids/{user_id}`
-- 获取用户的所有会话 ID 列表
+- **GET `/agent/tasks/{user_id}/{session_id}`**  
+  List all task IDs and statuses for a session.
 
-### 6. 获取系统信息
+- **DELETE `/agent/session/{user_id}/{session_id}`**  
+  Delete a session and all its tasks.
 
-- **GET** `/system/info`
-- 获取系统当前状态信息
+- **DELETE `/agent/task/{user_id}/{session_id}/{task_id}`**  
+  Delete a specific task from a session.
 
-### 7. 删除会话
+- **GET `/agent/active/sessionid/{user_id}`**  
+  Get the most recently updated session for a user.
 
-- **DELETE** `/agent/session/{user_id}/{session_id}`
-- 删除指定的会话
+### Long-Term Memory
 
-### 8. 写入长期记忆
+- **POST `/agent/write/longterm`**  
+  Write long-term memory for a user.  
+  **Body:** `{user_id, memory_info}`
 
-- **POST** `/agent/write/longterm`
-- 将信息写入用户的长期记忆
+### System & Health
 
-### 9. 健康检查
+- **GET `/system/info`**  
+  Get system-wide statistics: total sessions, active users, etc.
 
-- **GET** `/health`
-- 检查服务健康状态
+- **GET `/health`**  
+  Health check endpoint.
 
-## 重构说明
+---
 
-本项目从原始的 `01_backendServer.py` 单文件重构为模块化架构：
+## Project Value
 
-### 重构内容
+- **Scalable**: Asynchronous, distributed task processing with Celery.
+- **Extensible**: Easily add new tools, agent logic, or memory strategies.
+- **Production-Ready**: Robust error handling, session cleanup, and resource management.
+- **Human-in-the-Loop**: Real-world safety and compliance for tool use and critical actions.
+- **Observability**: System info and health endpoints for monitoring and operations.
 
-1. **数据模型分离** (`models/schemas.py`)
+---
 
-   - 将所有 Pydantic 数据模型集中管理
-   - 添加了详细的中文注释
-   - 支持多用户多会话的数据结构
+## Quick Start
 
-2. **Redis 服务优化** (`services/Redis_service.py`)
+### Prerequisites
 
-   - 重写为支持多用户多会话的版本
-   - 添加了会话清理和状态管理功能
-   - 改进了数据存储结构
+- Python 3.8+
+- Redis
+- PostgreSQL
 
-3. **业务逻辑分离** (`services/agent_service.py`)
+### Installation & Run
 
-   - 将智能体相关业务逻辑独立
-   - 包含智能体创建、执行、恢复等核心功能
-   - 添加了资源管理和清理功能
+1. **Install backend dependencies:**
 
-4. **API 路由分离** (`services/api_routes.py`)
+   ```bash
+   cd backend
+   pip install -r requirements.txt
+   ```
 
-   - 将所有 API 路由处理逻辑独立
-   - 统一的错误处理和日志记录
-   - 清晰的接口文档
+2. **Start Redis and PostgreSQL** (use Docker or system services).
 
-5. **工具模块** (`utils/`)
+3. **Start Celery worker:**
 
-   - 配置管理工具
-   - LLM 集成工具
-   - 智能体工具集合
+   ```bash
+   celery -A backend.services.agent_service worker --loglevel=info
+   ```
 
-6. **配置管理** (`config/`)
-   - 统一的配置管理
-   - 日志配置
-   - 环境变量支持
+4. **Start FastAPI server:**
 
-### 重构优势
+   ```bash
+   python main.py
+   ```
 
-- **模块化**: 代码结构清晰，便于维护和扩展
-- **可读性**: 添加了详细的中文注释
-- **可扩展性**: 模块化设计便于添加新功能
-- **可测试性**: 各模块独立，便于单元测试
-- **可部署性**: 支持环境变量配置，便于不同环境部署
+---
+
+## License
+
+MIT License
+
+---
+
+**Agent4prod1HIIL** empowers you to build safe, scalable, and intelligent agent applications for real-world, multi-user environments.
