@@ -5,6 +5,7 @@ langgraph-checkpoint-postgres
 fastapi
 uvicorn
 redis
+celery
 concurrent-log-handler
 pydantic-settings
 python-dotenv

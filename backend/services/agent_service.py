@@ -1,37 +1,38 @@
+import asyncio
+from celery import Celery
 import time
-from typing import Dict, Any, Optional, List
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres import AsyncPostgresStore
-from langchain_core.messages.utils import trim_messages
+from langgraph.types import Command, interrupt
 from psycopg_pool import AsyncConnectionPool
+from langchain_core.messages.utils import trim_messages
+from backend.config.settings import app_config
 from backend.config.logging import logger
-from backend.config import settings
-from backend.models.schemas import AgentResponse, AgentRequest, InterruptResponse
-from backend.services.Redis_service import RedisSessionManager
+from backend.utils.llms import get_llm
+from backend.utils.tools import get_tools
+from backend.models.schemas import AgentResponse
+from backend.services.Redis_service import get_session_manager, RedisSessionManager
+from fastapi import HTTPException
+from typing import Dict, Any, Optional, List
+
+# 注册/登录/鉴权相关函数（保留）
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
 
-# 全局变量存储智能体实例和数据库连接
-agent_instances: Dict[str, Any] = {}
-db_pool: Optional[AsyncConnectionPool] = None
-redis_manager: Optional[RedisSessionManager] = None
-
-# Password hashing context - using sha256_crypt for better compatibility
-pwd_context = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
-
-SECRET_KEY = "your_secret_key_here"  # Should be set in config
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
-
 def get_password_hash(password: str) -> str:
+    pwd_context = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
     return pwd_context.hash(password)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
+    pwd_context = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
     return pwd_context.verify(plain_password, hashed_password)
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
+    SECRET_KEY = app_config.SECRET_KEY
+    ALGORITHM = app_config.ALGORITHM
+    ACCESS_TOKEN_EXPIRE_MINUTES = app_config.ACCESS_TOKEN_EXPIRE_MINUTES
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
@@ -42,430 +43,517 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
     return encoded_jwt
 
 def decode_access_token(token: str):
+    SECRET_KEY = app_config.SECRET_KEY
+    ALGORITHM = app_config.ALGORITHM
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
     except JWTError:
         return None
 
-# 初始化数据库连接池
-async def init_db_pool():
-    """初始化PostgreSQL数据库连接池"""
-    global db_pool
-    if db_pool is None:
-        db_pool = AsyncConnectionPool(
-            conninfo=settings.DB_URI,
-            min_size=settings.MIN_SIZE,
-            max_size=settings.MAX_SIZE
-        )
-    return db_pool
+# Celery实例
+celery_app = Celery(
+    main='agent_service',
+    broker=app_config.CELERY_BROKER_URL
+)
+celery_app.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='Asia/Shanghai',
+    enable_utc=True,
+)
 
-# 初始化Redis管理器
-async def init_redis_manager():
-    """初始化Redis会话管理器"""
-    global redis_manager
-    if redis_manager is None:
-        redis_manager = RedisSessionManager(
-            redis_host=settings.REDIS_HOST,
-            redis_port=settings.REDIS_PORT,
-            redis_db=settings.REDIS_DB,
-            session_timeout=settings.SESSION_TIMEOUT
-        )
-    return redis_manager
+# 针对短期记忆修剪聊天历史消息 限制消息的token数量
+def trimmed_messages_hook(state):
+    """
+    修剪聊天历史消息，限制消息的 token 数量
 
-# 解析消息内容
+    Args:
+        state: 包含消息的字典，通常包含 "messages" 键
+
+    Returns:
+        dict: 包含修剪后消息的字典，键为 "llm_input_messages"
+    """
+    trimmed_messages = trim_messages(
+        messages=state["messages"],
+        max_tokens=20,
+        strategy="last",
+        token_counter=len,
+        start_on="human",
+        allow_partial=False
+    )
+    return {"llm_input_messages": trimmed_messages}
+
+# 读取指定用户长期记忆中的内容
+async def read_long_term_info(user_id: str, store):
+    """
+    读取指定用户长期记忆中的内容
+
+    Args:
+        user_id: 用户的唯一标识
+
+    Returns:
+        Dict[str, Any]: 包含记忆内容和状态的响应
+    """
+    try:
+        # 指定命名空间
+        namespace = ("memories", user_id)
+
+        # 搜索记忆内容
+        memories = await store.asearch(namespace, query="")
+
+        # 处理查询结果
+        if memories is None:
+            raise HTTPException(
+                status_code=500,
+                detail="查询返回无效结果，可能是存储系统错误。"
+            )
+
+        # 提取并拼接记忆内容
+        long_term_info = " ".join(
+            [d.value["data"] for d in memories if isinstance(d.value, dict) and "data" in d.value]
+        ) if memories else ""
+
+        # 记录查询成功的日志
+        logger.info(f"成功获取用户ID: {user_id} 的长期记忆，内容长度: {len(long_term_info)} 字符")
+
+        # 返回结构化响应
+        return {
+            "success": True,
+            "user_id": user_id,
+            "long_term_info": long_term_info,
+            "message": "长期记忆获取成功" if long_term_info else "未找到长期记忆内容"
+        }
+
+    except Exception as e:
+        # 处理其他未预期的错误
+        logger.error(f"获取用户ID: {user_id} 的长期记忆时发生意外错误: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"获取长期记忆失败: {str(e)}"
+        )
+
+# 解析state消息列表进行格式化展示
 async def parse_messages(messages: List[Any]) -> None:
     """
-    解析并打印消息内容，用于调试
-    
-    Args:
-        messages: 消息列表
-    """
-    for i, message in enumerate(messages):
-        if hasattr(message, 'content'):
-            logger.debug(f"Message {i}: {message.content}")
-        else:
-            logger.debug(f"Message {i}: {message}")
+    解析消息列表，打印 HumanMessage、AIMessage 和 ToolMessage 的详细信息
 
-# 处理智能体执行结果
+    Args:
+        messages: 包含消息的列表，每个消息是一个对象
+    """
+    print("=== 消息解析结果 ===")
+    for idx, msg in enumerate(messages, 1):
+        print(f"\n消息 {idx}:")
+        # 获取消息类型
+        msg_type = msg.__class__.__name__
+        print(f"类型: {msg_type}")
+        # 提取消息内容
+        content = getattr(msg, 'content', '')
+        print(f"内容: {content if content else '<空>'}")
+        # 处理附加信息
+        additional_kwargs = getattr(msg, 'additional_kwargs', {})
+        if additional_kwargs:
+            print("附加信息:")
+            for key, value in additional_kwargs.items():
+                if key == 'tool_calls' and value:
+                    print("  工具调用:")
+                    for tool_call in value:
+                        print(f"    - ID: {tool_call['id']}")
+                        print(f"      函数: {tool_call['function']['name']}")
+                        print(f"      参数: {tool_call['function']['arguments']}")
+                else:
+                    print(f"  {key}: {value}")
+        # 处理 ToolMessage 特有字段
+        if msg_type == 'ToolMessage':
+            tool_name = getattr(msg, 'name', '')
+            tool_call_id = getattr(msg, 'tool_call_id', '')
+            print(f"工具名称: {tool_name}")
+            print(f"工具调用 ID: {tool_call_id}")
+        # 处理 AIMessage 的工具调用和元数据
+        if msg_type == 'AIMessage':
+            tool_calls = getattr(msg, 'tool_calls', [])
+            if tool_calls:
+                print("工具调用:")
+                for tool_call in tool_calls:
+                    print(f"  - 名称: {tool_call['name']}")
+                    print(f"    参数: {tool_call['args']}")
+                    print(f"    ID: {tool_call['id']}")
+            # 提取元数据
+            metadata = getattr(msg, 'response_metadata', {})
+            if metadata:
+                print("元数据:")
+                token_usage = metadata.get('token_usage', {})
+                print(f"  令牌使用: {token_usage}")
+                print(f"  模型名称: {metadata.get('model_name', '未知')}")
+                print(f"  完成原因: {metadata.get('finish_reason', '未知')}")
+        # 打印消息 ID
+        msg_id = getattr(msg, 'id', '未知')
+        print(f"消息 ID: {msg_id}")
+        print("-" * 50)
+
+# 筛选最近一次完整对话
+def filter_last_human_conversation(data):
+    if data['result'] is not None:
+        # 获取 messages 列表
+        messages = data['result']['messages']
+
+        # 找到最后一个 type 为 human 的消息的索引
+        last_human_index = -1
+        for i, message in enumerate(messages):
+            if message['type'] == 'human':
+                last_human_index = i
+
+        # 如果没找到 human 消息，返回原始结构但 messages 为空
+        if last_human_index == -1:
+            return {
+                'session_id': data['session_id'],
+                'status': data['status'],
+                'timestamp': data['timestamp'],
+                'message': data['message'],
+                'result': {'messages': []}
+            }
+
+        # 筛选最后一个 human 消息及其后续消息
+        filtered_messages = messages[last_human_index:]
+
+        # 保留原始结构，只替换 messages
+        return {
+            'session_id': data['session_id'],
+            'status': data['status'],
+            'timestamp': data['timestamp'],
+            'message': data['message'],
+            'result': {'messages': filtered_messages}
+        }
+    # 若有中断数据
+    elif data['interrupt_data'] is not None:
+        return {
+            'session_id': data['session_id'],
+            'status': data['status'],
+            'timestamp': data['timestamp'],
+            'message': data['message'],
+            'result': {'interrupt_data': data['interrupt_data']}
+        }
+    else:
+        return {
+            'session_id': data['session_id'],
+            'status': data['status'],
+            'timestamp': data['timestamp'],
+            'message': data['message'],
+            'result': {'messages': []}
+        }
+
+# 处理智能体返回结果 可能是中断，也可能是最终结果
 async def process_agent_result(
         session_id: str,
+        task_id: str,
         result: Dict[str, Any],
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        session_manager: Optional[RedisSessionManager] = None
 ) -> AgentResponse:
     """
-    处理智能体执行结果，转换为标准响应格式
-    
+    处理智能体执行结果，统一处理中断和结果
+
     Args:
         session_id: 会话ID
+        task_id: 任务ID
         result: 智能体执行结果
-        user_id: 用户ID（可选）
-    
+        user_id: 用户ID，如果提供，将更新会话状态
+        session_manager: Redis会话管理器实例，用于更新会话状态
+
     Returns:
         AgentResponse: 标准化的响应对象
     """
+    response = None
     try:
-        # 检查结果类型
-        if "interrupt" in result:
-            # 处理中断情况
-            interrupt_data = result["interrupt"]
-            logger.info(f"智能体执行被中断: {interrupt_data}")
-            return AgentResponse(
+        # 检查是否有中断
+        if "__interrupt__" in result:
+            interrupt_data = result["__interrupt__"][0].value
+            # 确保中断数据有类型信息
+            if "interrupt_type" not in interrupt_data:
+                interrupt_data["interrupt_type"] = "unknown"
+            # 返回中断信息
+            response = AgentResponse(
                 session_id=session_id,
+                task_id=task_id,
                 status="interrupted",
                 interrupt_data=interrupt_data
             )
-        elif "error" in result:
-            # 处理错误情况
-            error_message = result["error"]
-            logger.error(f"智能体执行出错: {error_message}")
-            return AgentResponse(
-                session_id=session_id,
-                status="error",
-                message=str(error_message)
-            )
+            logger.info(f"当前触发工具调用中断:{response}")
+        # 如果没有中断，返回最终结果
         else:
-            # 处理正常完成情况
-            logger.info(f"智能体执行完成: {result}")
-            return AgentResponse(
+            response = AgentResponse(
                 session_id=session_id,
+                task_id=task_id,
                 status="completed",
                 result=result
             )
+            logger.info(f"最终智能体回复结果:{response}")
+
     except Exception as e:
-        # 处理异常情况
-        logger.error(f"处理智能体结果时出错: {e}")
-        return AgentResponse(
+        response = AgentResponse(
             session_id=session_id,
+            task_id=task_id,
             status="error",
-            message=f"处理结果时出错: {str(e)}"
+            message=f"处理智能体结果时出错: {str(e)}"
+        )
+        logger.error(f"处理智能体结果时出错:{response}")
+    # 检查指定用户ID的指定session_id是否存在
+    exists = await session_manager.session_id_exists(user_id, session_id)
+    # 若存在 则更新状态数据
+    if exists:
+        await session_manager.update_session(
+            user_id=user_id,
+            session_id=session_id,
+            task_id=task_id,
+            status=response.status,
+            last_query=None,
+            last_response=response,
+            last_updated=time.time(),
+            ttl=app_config.TTL
         )
 
-# 消息裁剪钩子函数
-def trimmed_messages_hook(state):
-    """
-    消息裁剪钩子函数，用于处理消息长度限制
-    
-    Args:
-        state: 当前状态
-    
-    Returns:
-        处理后的状态
-    """
-    messages = state["messages"]
-    if len(messages) > 10:
-        # 如果消息数量超过10条，进行裁剪
-        trimmed = trim_messages(messages, max_tokens=4000)
-        state["messages"] = trimmed
-    return state
+    return response
 
-# 读取长期记忆信息
-async def read_long_term_info(user_id: str) -> str:
+# 定义Celery任务：异步运行智能体
+@celery_app.task
+def invoke_agent_task(user_id: str, session_id: str, task_id: str, query: str, system_prompt: str):
     """
-    从Redis读取用户的长期记忆信息
-    
-    Args:
-        user_id: 用户ID
-    
-    Returns:
-        str: 长期记忆信息
-    """
-    try:
-        redis_manager = await init_redis_manager()
-        # 从Redis读取长期记忆
-        memory_data = await redis_manager.redis_client.get(f"long_term_memory:{user_id}")
-        if memory_data:
-            return memory_data
-        else:
-            return "无长期记忆信息"
-    except Exception as e:
-        logger.error(f"读取长期记忆失败: {e}")
-        return f"读取长期记忆失败: {str(e)}"
+    异步运行智能体，处理用户请求并返回结果
 
-# 写入长期记忆信息
-async def write_long_term_info(user_id: str, memory_info: str) -> bool:
-    """
-    将信息写入用户的长期记忆
-    
     Args:
-        user_id: 用户ID
-        memory_info: 要写入的记忆信息
-    
-    Returns:
-        bool: 写入是否成功
-    """
-    try:
-        redis_manager = await init_redis_manager()
-        # 将记忆信息写入Redis，设置过期时间为30天
-        await redis_manager.redis_client.set(
-            f"long_term_memory:{user_id}",
-            memory_info,
-            ex=30 * 24 * 3600  # 30天
-        )
-        logger.info(f"成功写入长期记忆: user_id={user_id}")
-        return True
-    except Exception as e:
-        logger.error(f"写入长期记忆失败: {e}")
-        return False
+        user_id: 用户唯一标识
+        session_id: 会话唯一标识
+        task_id: 任务唯一标识
+        query: 用户的问题
+        system_prompt: 系统提示词
 
-# 获取或创建智能体实例
-async def get_or_create_agent(session_id: str) -> Any:
-    """
-    获取或创建智能体实例
-    
-    Args:
-        session_id: 会话ID
-    
     Returns:
-        Any: 智能体实例
+        dict: 智能体处理结果，转换为字典格式
     """
-    if session_id not in agent_instances:
+    # 异步执行智能体调用逻辑
+    async def run_invoke():
         try:
-            # 初始化数据库连接池
-            db_pool = await init_db_pool()
-            
-            # 创建PostgreSQL存储
-            store = AsyncPostgresStore(
-                pool=db_pool,
-                table_name=f"checkpoints_{session_id}"
+            # 初始化Redis会话管理器
+            session_manager = get_session_manager()
+
+            # 更新会话状态为运行中
+            await session_manager.update_session(
+                user_id=user_id,
+                session_id=session_id,
+                task_id=task_id,
+                status="running",
+                last_query=query,
+                last_updated=time.time(),
+                ttl=app_config.TTL
             )
-            
-            # 创建PostgreSQL保存器
-            saver = AsyncPostgresSaver(
-                pool=db_pool,
-                table_name=f"checkpoints_{session_id}"
-            )
-            
-            # 导入工具和LLM
-            from backend.utils.tools import get_tools
-            from backend.utils.llms import get_llm
-            
-            # 获取工具和LLM
-            tools = get_tools()
-            llm = get_llm()
-            
-            # 创建React智能体
-            agent = create_react_agent(
-                llm=llm,
-                tools=tools,
-                state_modifier=trimmed_messages_hook
-            )
-            
-            # 绑定存储和保存器
-            app = agent.bind(
-                checkpointer=saver,
-                interrupt_before=["action"]
-            )
-            
-            # 存储智能体实例
-            agent_instances[session_id] = app
-            
-            logger.info(f"创建新的智能体实例: session_id={session_id}")
-            
+
+            # 创建数据库连接池
+            async with AsyncConnectionPool(
+                conninfo=app_config.DB_URI,
+                min_size=app_config.MIN_SIZE,
+                max_size=app_config.MAX_SIZE,
+                kwargs={"autocommit": True, "prepare_threshold": 0}
+            ) as pool:
+                # 初始化短期记忆检查点
+                checkpointer = AsyncPostgresSaver(pool)
+                # 初始化长期记忆存储
+                store = AsyncPostgresStore(pool)
+                # 获取语言模型
+                llm_chat, _ = get_llm(app_config.LLM_TYPE)
+                # 获取工具列表
+                tools = await get_tools()
+
+                # 创建ReAct智能体
+                agent = create_react_agent(
+                    model=llm_chat,
+                    tools=tools,
+                    pre_model_hook=trimmed_messages_hook,
+                    checkpointer=checkpointer,
+                    store=store
+                )
+
+                # 获取长期记忆
+                system_message = system_prompt
+                result = await read_long_term_info(user_id, store)
+                # 检查返回结果是否成功
+                if result.get("success", False):
+                    long_term_info = result.get("long_term_info")
+                    # 若获取到的内容不为空，拼接到系统提示词
+                    if long_term_info:
+                        system_message = f"{system_prompt}我的附加信息有:{long_term_info}"
+                        logger.info(f"获取用户长期记忆，system_message的信息为:{system_message}")
+
+                # 构造智能体输入消息体
+                messages = [
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": query}
+                ]
+
+                # 调用智能体
+                result = await agent.ainvoke(
+                    {"messages": messages},
+                    config={"configurable": {"thread_id": task_id}}
+                )
+
+                # 解析返回的消息
+                await parse_messages(result['messages'])
+                # 处理智能体结果
+                response = await process_agent_result(session_id, task_id, result, user_id, session_manager)
+
+                # 对response进行处理 筛选出最近一次的完整对话更新到该task中
+                logger.info(f"invoke_response:{response.model_dump()}")
+                filtered_data = filter_last_human_conversation(response.model_dump())
+
+                # 更新任务状态为完成并绑定用户和会话
+                await session_manager.set_task_status(
+                    task_id=task_id,
+                    status="completed",
+                    # result=response.model_dump(),
+                    result=filtered_data,
+                    user_id=user_id,
+                    session_id=session_id
+                )
+
+                return response.model_dump()
+
         except Exception as e:
-            logger.error(f"创建智能体实例失败: {e}")
-            raise
-    
-    return agent_instances[session_id]
-
-# 执行智能体
-async def execute_agent(request: AgentRequest) -> AgentResponse:
-    """
-    执行智能体
-    
-    Args:
-        request: 智能体请求
-    
-    Returns:
-        AgentResponse: 执行结果
-    """
-    try:
-        # 初始化Redis管理器
-        redis_manager = await init_redis_manager()
-        
-        # 获取或创建智能体实例
-        agent = await get_or_create_agent(request.session_id)
-        
-        # 更新会话状态为运行中
-        await redis_manager.update_session(
-            user_id=request.user_id,
-            session_id=request.session_id,
-            status="running",
-            last_query=request.query,
-            last_updated=time.time()
-        )
-        
-        # 读取长期记忆
-        long_term_memory = await read_long_term_info(request.user_id)
-        
-        # 构建系统消息
-        system_message = request.system_message or "你会使用工具来帮助用户。如果工具使用被拒绝，请提示用户。"
-        if long_term_memory and long_term_memory != "无长期记忆信息":
-            system_message += f"\n\n用户的长期记忆信息：{long_term_memory}"
-        
-        # 执行智能体
-        result = await agent.ainvoke({
-            "messages": [{
-                "role": "system",
-                "content": system_message
-            }, {
-                "role": "user",
-                "content": request.query
-            }]
-        })
-        
-        # 处理执行结果
-        agent_response = await process_agent_result(
-            session_id=request.session_id,
-            result=result,
-            user_id=request.user_id
-        )
-        
-        # 更新会话状态
-        status = "idle" if agent_response.status == "completed" else agent_response.status
-        await redis_manager.update_session(
-            user_id=request.user_id,
-            session_id=request.session_id,
-            status=status,
-            last_response=agent_response,
-            last_updated=time.time()
-        )
-        
-        return agent_response
-        
-    except Exception as e:
-        logger.error(f"执行智能体失败: {e}")
-        
-        # 更新会话状态为错误
-        if redis_manager:
-            await redis_manager.update_session(
-                user_id=request.user_id,
-                session_id=request.session_id,
+            # 构造错误响应
+            error_response = AgentResponse(
+                session_id=session_id,
+                task_id=task_id,
                 status="error",
-                last_updated=time.time()
+                message=f"处理请求时出错: {str(e)}"
             )
-        
-        return AgentResponse(
-            session_id=request.session_id,
-            status="error",
-            message=f"执行智能体失败: {str(e)}"
-        )
-
-# 恢复智能体执行
-async def resume_agent(response: InterruptResponse) -> AgentResponse:
-    """
-    恢复智能体执行
-    
-    Args:
-        response: 中断响应
-    
-    Returns:
-        AgentResponse: 执行结果
-    """
-    try:
-        # 初始化Redis管理器
-        redis_manager = await init_redis_manager()
-        
-        # 获取智能体实例
-        agent = await get_or_create_agent(response.session_id)
-        
-        # 更新会话状态为运行中
-        await redis_manager.update_session(
-            user_id=response.user_id,
-            session_id=response.session_id,
-            status="running",
-            last_updated=time.time()
-        )
-        
-        # 根据响应类型处理中断
-        if response.response_type == "accept":
-            # 接受工具调用
-            result = await agent.ainvoke({
-                "messages": [{
-                    "role": "user",
-                    "content": "请继续执行"
-                }]
-            })
-        elif response.response_type == "edit":
-            # 编辑工具参数
-            result = await agent.ainvoke({
-                "messages": [{
-                    "role": "user",
-                    "content": f"请使用修改后的参数继续执行: {response.args}"
-                }]
-            })
-        elif response.response_type == "response":
-            # 直接反馈信息
-            result = await agent.ainvoke({
-                "messages": [{
-                    "role": "user",
-                    "content": f"用户反馈: {response.args}"
-                }]
-            })
-        elif response.response_type == "reject":
-            # 拒绝工具调用
-            result = await agent.ainvoke({
-                "messages": [{
-                    "role": "user",
-                    "content": "工具调用被拒绝，请重新考虑解决方案"
-                }]
-            })
-        else:
-            raise ValueError(f"不支持的响应类型: {response.response_type}")
-        
-        # 处理执行结果
-        agent_response = await process_agent_result(
-            session_id=response.session_id,
-            result=result,
-            user_id=response.user_id
-        )
-        
-        # 更新会话状态
-        status = "idle" if agent_response.status == "completed" else agent_response.status
-        await redis_manager.update_session(
-            user_id=response.user_id,
-            session_id=response.session_id,
-            status=status,
-            last_response=agent_response,
-            last_updated=time.time()
-        )
-        
-        return agent_response
-        
-    except Exception as e:
-        logger.error(f"恢复智能体执行失败: {e}")
-        
-        # 更新会话状态为错误
-        if redis_manager:
-            await redis_manager.update_session(
-                user_id=response.user_id,
-                session_id=response.session_id,
+            # 更新会话状态为错误
+            await session_manager.update_session(
+                user_id=user_id,
+                session_id=session_id,
+                task_id=task_id,
                 status="error",
-                last_updated=time.time()
+                last_response=error_response,
+                last_updated=time.time(),
+                ttl=app_config.TTL
             )
-        
-        return AgentResponse(
-            session_id=response.session_id,
-            status="error",
-            message=f"恢复智能体执行失败: {str(e)}"
-        )
+            # 更新任务状态为失败并绑定用户和会话
+            await session_manager.set_task_status(
+                task_id=task_id,
+                status="failed",
+                error=str(e),
+                user_id=user_id,
+                session_id=session_id
+            )
+            raise e
+        finally:
+            # 关闭Redis连接
+            await session_manager.close()
 
-# 清理资源
-async def cleanup_resources():
-    """清理所有资源"""
-    global db_pool, redis_manager
-    
-    # 关闭数据库连接池
-    if db_pool:
-        await db_pool.close()
-        db_pool = None
-    
-    # 关闭Redis连接
-    if redis_manager:
-        await redis_manager.close()
-        redis_manager = None
-    
-    # 清空智能体实例
-    agent_instances.clear()
-    
-    logger.info("资源清理完成") 
+    return asyncio.run(run_invoke())
+
+
+# 定义Celery任务：异步运行智能体
+@celery_app.task
+def resume_agent_task(user_id: str, session_id: str, task_id: str, command_data: str):
+    """
+    异步运行智能体，处理用户请求并返回结果
+
+    Args:
+        user_id: 用户唯一标识
+        session_id: 会话唯一标识
+        task_id: 任务唯一标识
+        query: 用户的问题
+        system_prompt: 系统提示词
+
+    Returns:
+        dict: 智能体处理结果，转换为字典格式
+    """
+    # 异步执行智能体调用逻辑
+    async def resume_invoke():
+        try:
+            # 初始化Redis会话管理器
+            session_manager = get_session_manager()
+
+            # 创建数据库连接池
+            async with AsyncConnectionPool(
+                conninfo=app_config.DB_URI,
+                min_size=app_config.MIN_SIZE,
+                max_size=app_config.MAX_SIZE,
+                kwargs={"autocommit": True, "prepare_threshold": 0}
+            ) as pool:
+                # 初始化短期记忆检查点
+                checkpointer = AsyncPostgresSaver(pool)
+                # 初始化长期记忆存储
+                store = AsyncPostgresStore(pool)
+                # 获取语言模型
+                llm_chat, _ = get_llm(app_config.LLM_TYPE)
+                # 获取工具列表
+                tools = await get_tools()
+
+                # 创建ReAct智能体
+                agent = create_react_agent(
+                    model=llm_chat,
+                    tools=tools,
+                    pre_model_hook=trimmed_messages_hook,
+                    checkpointer=checkpointer,
+                    store=store
+                )
+
+                # 调用智能体
+                result = await agent.ainvoke(
+                    Command(resume=command_data),
+                    config={"configurable": {"thread_id": task_id}}
+                )
+
+                # 解析返回的消息
+                await parse_messages(result['messages'])
+                # 处理智能体结果
+                response = await process_agent_result(session_id, task_id, result, user_id, session_manager)
+
+                # 对response进行处理 筛选出最近一次的完整对话更新到该task中
+                logger.info(f"resume_response:{response.model_dump()}")
+                filtered_data = filter_last_human_conversation(response.model_dump())
+
+                # 更新任务状态为完成并绑定用户和会话
+                await session_manager.set_task_status(
+                    task_id=task_id,
+                    status="completed",
+                    # result=response.model_dump(),
+                    result=filtered_data,
+                    user_id=user_id,
+                    session_id=session_id
+                )
+
+                return response.model_dump()
+
+        except Exception as e:
+            # 构造错误响应
+            error_response = AgentResponse(
+                session_id=session_id,
+                task_id=task_id,
+                status="error",
+                message=f"处理请求时出错: {str(e)}"
+            )
+            # 更新会话状态为错误
+            await session_manager.update_session(
+                user_id=user_id,
+                session_id=session_id,
+                task_id=task_id,
+                status="error",
+                last_response=error_response,
+                last_updated=time.time(),
+                ttl=app_config.TTL
+            )
+            # 更新任务状态为失败并绑定用户和会话
+            await session_manager.set_task_status(
+                task_id=task_id,
+                status="failed",
+                error=str(e),
+                user_id=user_id,
+                session_id=session_id
+            )
+            raise e
+        finally:
+            # 关闭Redis连接
+            await session_manager.close()
+
+    return asyncio.run(resume_invoke())
