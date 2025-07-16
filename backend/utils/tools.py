@@ -1,11 +1,12 @@
+import logging
 from typing import Callable
 from langchain_core.tools import BaseTool, tool as create_tool
 from langchain_core.runnables import RunnableConfig
 from langgraph.prebuilt.interrupt import HumanInterruptConfig, HumanInterrupt
 from langgraph.types import interrupt
 from langchain_core.tools import tool
+from backend.config.logging import logger
 from langchain_mcp_adapters.client import MultiServerMCPClient
-
 
 # 为工具添加人工审查（human-in-the-loop）功能
 async def add_human_in_the_loop(
@@ -13,22 +14,8 @@ async def add_human_in_the_loop(
         *,
         interrupt_config: HumanInterruptConfig = None,
 ) -> BaseTool:
-    """
-    为工具添加人工审查（human-in-the-loop）
-
-    Args:
-        tool: 可调用对象或 BaseTool 对象
-        interrupt_config: 可选的人工中断配置
-
-    Returns:
-        BaseTool: 一个带有人工审查功能的 BaseTool 对象
-    """
-    # 检查传入的工具是否为 BaseTool 的实例
     if not isinstance(tool, BaseTool):
-        # 如果不是 BaseTool，则将可调用对象转换为 BaseTool 对象
         tool = create_tool(tool)
-
-    # 使用 create_tool 装饰器定义一个新的工具函数，继承原工具的名称、描述和参数模式
     @create_tool(
         tool.name,
         description=tool.description,
@@ -36,7 +23,6 @@ async def add_human_in_the_loop(
     )
     # 定义内部函数，用于处理带有中断逻辑的工具调用
     async def call_tool_with_interrupt(config: RunnableConfig, **tool_input):
-        # 创建一个人为中断请求，包含工具名称、输入参数和配置
         request: HumanInterrupt = {
             "action_request": {
                 "action": tool.name,
@@ -82,7 +68,6 @@ async def add_human_in_the_loop(
             # 如果是响应，直接将用户反馈作为工具的响应
             user_feedback = response["args"]
             tool_response = user_feedback
-
         else:
             raise ValueError(f"Unsupported interrupt response type: {response['type']}")
 
@@ -127,7 +112,7 @@ async def get_tools():
     client = MultiServerMCPClient({
         # 高德地图MCP Server
         "amap-amap-sse": {
-            "url": "https://mcp.amap.com/sse?key=848232bewe1987634de9ew23e19wewed61265e50bb0757",
+            "url": "https://mcp.amap.com/sse?key=8489a1e2b419d5e996be19d64a65e50bb0757",
             "transport": "sse",
         }
     })
